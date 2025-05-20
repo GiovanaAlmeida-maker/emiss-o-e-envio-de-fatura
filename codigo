@@ -1,0 +1,133 @@
+from flask import Flask, request, jsonify, send_file
+from flask_sqlalchemy import SQLAlchemy
+from datetime import datetime
+import os
+import unittest
+
+# Funções utilitárias locais (temporárias)
+def gerar_pdf(pedido):
+    os.makedirs("notas", exist_ok=True)
+    path = os.path.join("notas", f"nota_{pedido.id}.pdf")
+    with open(path, 'w') as f:
+        f.write(f"Nota Fiscal PDF\nCliente: {pedido.cliente}\nValor: R${pedido.valor}\nData: {pedido.data}")
+    return path
+
+def gerar_xml(pedido):
+    os.makedirs("notas", exist_ok=True)
+    path = os.path.join("notas", f"nota_{pedido.id}.xml")
+    with open(path, 'w') as f:
+        f.write(f"<nota><cliente>{pedido.cliente}</cliente><valor>{pedido.valor}</valor><data>{pedido.data}</data></nota>")
+    return path
+
+def enviar_email(destinatario, pdf_path, xml_path):
+    print(f"[SIMULADO] Enviando e-mail para {destinatario} com anexos {pdf_path} e {xml_path}")
+
+app = Flask(__name__)
+db_path = os.path.join(os.getcwd(), 'database.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
+app.config['TESTING'] = True
+db = SQLAlchemy(app)
+
+# MODELOS
+class Pedido(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    cliente = db.Column(db.String(100))
+    valor = db.Column(db.Float)
+    data = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Fatura(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    pedido_id = db.Column(db.Integer, db.ForeignKey('pedido.id'))
+    pdf_path = db.Column(db.String(200))
+    xml_path = db.Column(db.String(200))
+
+# ROTAS
+@app.route('/emitir_fatura', methods=['POST'])
+def emitir_fatura():
+    dados = request.json
+    cliente = dados['cliente']
+    valor = dados['valor']
+
+    pedido = Pedido(cliente=cliente, valor=valor)
+    db.session.add(pedido)
+    db.session.commit()
+
+    pdf_path = gerar_pdf(pedido)
+    xml_path = gerar_xml(pedido)
+
+    fatura = Fatura(pedido_id=pedido.id, pdf_path=pdf_path, xml_path=xml_path)
+    db.session.add(fatura)
+    db.session.commit()
+
+    return jsonify({'mensagem': 'Fatura emitida com sucesso!', 'pedido_id': pedido.id})
+
+@app.route('/historico_pedidos', methods=['GET'])
+def historico_pedidos():
+    pedidos = Pedido.query.all()
+    return jsonify([
+        {'id': p.id, 'cliente': p.cliente, 'valor': p.valor, 'data': p.data.strftime('%Y-%m-%d %H:%M')} for p in pedidos
+    ])
+
+@app.route('/nota_fiscal/<int:pedido_id>', methods=['GET'])
+def nota_fiscal(pedido_id):
+    fatura = Fatura.query.filter_by(pedido_id=pedido_id).first()
+    if not fatura:
+        return jsonify({'erro': 'Fatura não encontrada'}), 404
+    return jsonify({'pdf': fatura.pdf_path, 'xml': fatura.xml_path})
+
+@app.route('/enviar_nota/<int:pedido_id>', methods=['POST'])
+def enviar_nota(pedido_id):
+    fatura = Fatura.query.filter_by(pedido_id=pedido_id).first()
+    if not fatura:
+        return jsonify({'erro': 'Fatura não encontrada'}), 404
+
+    dados = request.json
+    email_destino = dados['email']
+    enviar_email(email_destino, fatura.pdf_path, fatura.xml_path)
+    return jsonify({'mensagem': 'Nota enviada com sucesso para ' + email_destino})
+
+# TESTES
+class TesteRotas(unittest.TestCase):
+    def setUp(self):
+        app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
+        self.app = app.test_client()
+        with app.app_context():
+            db.create_all()
+
+    def test_emitir_fatura(self):
+        resposta = self.app.post('/emitir_fatura', json={'cliente': 'João', 'valor': 150.75})
+        self.assertEqual(resposta.status_code, 200)
+        dados = resposta.get_json()
+        self.assertIn('pedido_id', dados)
+
+    def test_historico_pedidos(self):
+        self.app.post('/emitir_fatura', json={'cliente': 'Maria', 'valor': 99.90})
+        resposta = self.app.get('/historico_pedidos')
+        self.assertEqual(resposta.status_code, 200)
+        self.assertGreaterEqual(len(resposta.get_json()), 1)
+
+    def test_nota_fiscal(self):
+        emitido = self.app.post('/emitir_fatura', json={'cliente': 'Carlos', 'valor': 200.00})
+        pedido_id = emitido.get_json()['pedido_id']
+        resposta = self.app.get(f'/nota_fiscal/{pedido_id}')
+        self.assertEqual(resposta.status_code, 200)
+        dados = resposta.get_json()
+        self.assertIn('pdf', dados)
+        self.assertIn('xml', dados)
+
+    def test_enviar_nota(self):
+        emitido = self.app.post('/emitir_fatura', json={'cliente': 'Ana', 'valor': 300.00})
+        pedido_id = emitido.get_json()['pedido_id']
+        resposta = self.app.post(f'/enviar_nota/{pedido_id}', json={'email': 'ana@teste.com'})
+        self.assertEqual(resposta.status_code, 200)
+        self.assertIn('mensagem', resposta.get_json())
+
+if __name__ == '__main__':
+    try:
+        with app.app_context():
+            if not os.path.exists(db_path):
+                db.create_all()
+        # Evita multiprocessing e problemas com _multiprocessing
+        app.run(debug=False)
+    except Exception as e:
+        print(f"Erro ao iniciar o servidor: {e}")
